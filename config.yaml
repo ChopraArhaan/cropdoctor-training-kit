@@ -1,0 +1,60 @@
+# CropDoctor training configuration. Edit here instead of touching the scripts.
+
+img_size: 256            # model input is img_size x img_size. The app reads this from model_meta.json.
+seed: 42
+
+paths:
+  raw_dir: data/raw           # downloaded datasets
+  manifest: data/manifest.csv # one row per image: path,label,source,is_field,split
+  negatives_dir: data/negatives   # drop photos of things that are NOT crop leaves here (soil, hands, walls, tools, screens, sacks)
+  runs_dir: runs
+  export_dir: export
+
+# Datasets. is_field=true means real field/phone photos (as opposed to plain-background lab photos).
+# Field photos are over-represented in val/test so reported accuracy reflects what a farmer's phone sees.
+sources:
+  - {name: plantvillage,  kind: kaggle, handle: vipoooool/new-plant-diseases-dataset,           field: false}
+  - {name: plantdoc,      kind: kaggle, handle: nirmalsankalana/plantdoc-dataset,               field: true}
+  - {name: rice_leaf,     kind: kaggle, handle: vbookshelf/rice-leaf-diseases,   crop: Rice,      field: false}
+  - {name: sugarcane,     kind: kaggle, handle: nirmalsankalana/sugarcane-leaf-disease-dataset, crop: Sugarcane, field: true}
+  - {name: cotton,        kind: hf,     handle: Project-AgML/cotton_leaf_disease_classification, crop: Cotton, field: true, split: "train"}
+  - {name: paddy_doctor,  kind: hf,     handle: anthony2261/paddy-disease-classification,       crop: Rice,   field: true, split: "train"}
+  # Your own labelled photos: data/my_photos/<Crop___disease_id or any name the taxonomy understands>/*.jpg
+  - {name: my_photos,     kind: local,  path: data/my_photos, field: true}
+  - {name: research_merged, kind: local, path: C:/Users/ASUS/Downloads/Research/merged, field: true}
+
+data:
+  max_per_class: 1500     # cap per class (field photos are kept first)
+  min_per_class: 40       # classes with fewer images are dropped with a warning
+  dedup_hamming: 6        # near-duplicate threshold for perceptual hash grouping (leak-free split)
+  # split fractions (train/val/test) for FIELD groups and LAB groups
+  split_field: [0.60, 0.20, 0.20]
+  split_lab:   [0.85, 0.08, 0.07]
+
+negatives:                # the "Background___not_a_leaf" class
+  use_dtd: false          # Describable Textures (walls, soil-ish, fabric...) auto-downloaded by torchvision
+  use_pets: false         # Oxford-IIIT Pets (animals / household scenes) auto-downloaded by torchvision
+  max_total: 2500
+
+train:
+  batch: 48
+  workers: 6
+  epochs_head: 2          # backbone frozen
+  epochs_full: 14         # everything unfrozen
+  lr_head: 1.0e-3
+  lr_full: 3.0e-4
+  weight_decay: 0.05
+  label_smoothing: 0.1
+  mixup: 0.2
+  cutmix: 1.0
+  ema_decay: 0.999
+  field_weight: 2.0       # sampling weight of field photos vs lab photos
+  patience: 4
+
+# Bake-off candidates (timm model names). The bake-off trains each briefly and prints a table.
+models:
+  - mobilenetv4_conv_medium.e500_r256_in1k
+  - mobilenetv4_hybrid_medium.e500_r256_in1k
+  - convnextv2_nano.fcmae_ft_in22k_in1k
+  - tf_efficientnetv2_b0.in1k
+  - mobilenetv3_large_100.ra_in1k   # small baseline

@@ -1,0 +1,28 @@
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+.venv/
+venv/
+ENV/
+
+# Datasets & Training outputs
+data/raw/
+data/manifest.csv
+data/unmapped.txt
+data/negatives/
+data/my_photos/
+data/my_test_photos/
+runs/
+export/
+*.pt
+*.pth
+*.tflite
+*.onnx
+
+# IDE & OS
+.idea/
+.vscode/
+*.swp
+.DS_Store
+Thumbs.db
