@@ -42,23 +42,9 @@ negatives:                # the "Background___not_a_leaf" class
 
 train:
   batch: 48
-  workers: 6
-  epochs_head: 2          # backbone frozen
-  epochs_full: 14         # everything unfrozen
-  lr_head: 1.0e-3
-  lr_full: 3.0e-4
+  workers: 4              # use 0 if Windows data-loader workers crash (or pass --workers 0)
+  lr_head: 1.0e-3         # first epoch: only the new classifier layer learns
+  lr_full: 3.0e-4         # remaining epochs: whole network
   weight_decay: 0.05
   label_smoothing: 0.1
-  mixup: 0.2
-  cutmix: 1.0
-  ema_decay: 0.999
-  field_weight: 2.0       # sampling weight of field photos vs lab photos
-  patience: 4
-
-# Bake-off candidates (timm model names). The bake-off trains each briefly and prints a table.
-models:
-  - mobilenetv4_conv_medium.e500_r256_in1k
-  - mobilenetv4_hybrid_medium.e500_r256_in1k
-  - convnextv2_nano.fcmae_ft_in22k_in1k
-  - tf_efficientnetv2_b0.in1k
-  - mobilenetv3_large_100.ra_in1k   # small baseline
+  field_weight: 2.0       # real field photos are drawn this much more often than lab photos

@@ -1,216 +1,303 @@
 """
-Step 2: train one model.
+Train the CropDoctor classifier. One script: train -> calibrate -> test report.
 
-    python train.py --model mobilenetv4_conv_medium.e500_r256_in1k
-    python train.py --model convnextv2_nano.fcmae_ft_in22k_in1k --epochs-full 20
+    python train.py                       # default: ~15-30 min on a mid-range GPU
+    python train.py --epochs 8 --samples 20000     # longer / better
+    python train.py --model convnextv2_nano.fcmae_ft_in22k_in1k   # another backbone
 
-Writes runs/<model>/{best.pt, metrics.json, labels.txt}.
-Selection metric = macro-F1 on the validation split (which over-samples real field photos).
+Needs data/manifest.csv from prepare_data.py. It fine-tunes an ImageNet-pretrained backbone (downloaded
+automatically by timm), so it converges in a few epochs: the heavy lifting was already done by the pretrained weights.
+Output: runs/<model>/best.pt, labels.txt, metrics.json. Then run export.py.
 """
 import argparse
+import csv
 import json
+import math
+import random
 import time
 from pathlib import Path
 
 import numpy as np
 import timm
 import torch
-from timm.data import Mixup
-from timm.loss import SoftTargetCrossEntropy
-from timm.utils import ModelEmaV3
-from torch.utils.data import DataLoader, WeightedRandomSampler
+import torchvision.transforms as T
+import yaml
+from PIL import Image, ImageFile
+from torch.utils.data import DataLoader, Dataset, WeightedRandomSampler
 from tqdm import tqdm
 
-from common import (ManifestDataset, cosine_lr, fit_temperature, load_cfg, make_transforms, predict_logits,
-                    read_manifest, seed_all, summarize)
+ImageFile.LOAD_TRUNCATED_IMAGES = True
+DEFAULT_MODEL = "mobilenetv4_conv_medium.e500_r256_in1k"
 
 
-def build_loaders(cfg, mean, std, class_to_idx, samples_per_epoch=None, val_subset=None):
+# ------------------------------------------------------------------ data
+class CenterSquare:
+    """Centre-crop to a square. The Android app does exactly this before resizing, so keep it in sync."""
+
+    def __call__(self, im):
+        w, h = im.size
+        s = min(w, h)
+        left, top = (w - s) // 2, (h - s) // 2
+        return im.crop((left, top, left + s, top + s))
+
+
+def make_transform(size, mean, std, train):
+    if train:
+        return T.Compose([
+            T.RandomResizedCrop(size, scale=(0.4, 1.0)),
+            T.RandomHorizontalFlip(), T.RandomVerticalFlip(),
+            T.ColorJitter(0.3, 0.3, 0.3, 0.03),
+            T.RandomApply([T.GaussianBlur(5, (0.1, 2.0))], p=0.2),   # phone shake / missed focus
+            T.ToTensor(), T.Normalize(mean, std),
+        ])
+    return T.Compose([CenterSquare(), T.Resize((size, size)), T.ToTensor(), T.Normalize(mean, std)])
+
+
+class Rows(Dataset):
+    def __init__(self, rows, class_index, transform):
+        self.rows, self.idx, self.tf = rows, class_index, transform
+
+    def __len__(self):
+        return len(self.rows)
+
+    def __getitem__(self, i):
+        r = self.rows[i]
+        try:
+            im = Image.open(r["path"])
+            im.draft("RGB", (512, 512))      # JPEG: decode big phone photos at reduced size (much faster)
+            im = im.convert("RGB")
+        except Exception:                    # unreadable file: a grey image instead of a crash
+            im = Image.new("RGB", (256, 256), (127, 127, 127))
+        return self.tf(im), self.idx[r["label"]]
+
+
+def read_manifest(path):
+    with open(path, newline="", encoding="utf-8") as f:
+        rows = list(csv.DictReader(f))
+    for r in rows:
+        r["is_field"] = r["is_field"] == "1"
+    return rows
+
+
+# ------------------------------------------------------------------ metrics
+@torch.no_grad()
+def predict(model, loader, device):
+    model.eval()
+    outs, ys = [], []
+    for x, y in loader:
+        x = x.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
+        with torch.autocast(device.type, enabled=device.type == "cuda"):
+            outs.append(model(x).float().cpu())
+        ys.append(y)
+    return torch.cat(outs), torch.cat(ys)
+
+
+def macro_f1(y, p, n):
+    f1 = []
+    for c in range(n):
+        tp = int(((p == c) & (y == c)).sum())
+        fp = int(((p == c) & (y != c)).sum())
+        fn = int(((p != c) & (y == c)).sum())
+        if tp + fp + fn:
+            f1.append(2 * tp / (2 * tp + fp + fn))
+    return float(np.mean(f1)) if f1 else 0.0
+
+
+def fit_temperature(logits, labels):
+    """One scalar T so that softmax(logits / T) is honest about its confidence. Fit on validation data."""
+    t = torch.nn.Parameter(torch.ones(1))
+    opt = torch.optim.LBFGS([t], lr=0.05, max_iter=200)
+    ce = torch.nn.CrossEntropyLoss()
+
+    def closure():
+        opt.zero_grad()
+        loss = ce(logits / t.clamp(min=0.05), labels)
+        loss.backward()
+        return loss
+
+    opt.step(closure)
+    return float(t.clamp(min=0.05).item())
+
+
+def ece(probs, labels, bins=15):
+    conf, pred = probs.max(1)
+    acc = (pred == labels).float()
+    edges = torch.linspace(0, 1, bins + 1)
+    total = 0.0
+    for lo, hi in zip(edges[:-1], edges[1:]):
+        m = (conf > lo) & (conf <= hi)
+        if m.any():
+            total += m.float().mean().item() * abs(acc[m].mean().item() - conf[m].mean().item())
+    return total
+
+
+def report(logits, labels, is_field, names, temp=1.0):
+    probs = torch.softmax(logits / temp, 1)
+    y, p = labels.numpy(), probs.argmax(1).numpy()
+    conf = probs.max(1).values.numpy()
+    field = np.array(is_field, dtype=bool)
+    out = {
+        "n": int(len(y)),
+        "acc": float((p == y).mean()),
+        "macro_f1": macro_f1(y, p, len(names)),
+        "top3": float((probs.topk(min(3, probs.shape[1]), 1).indices == labels[:, None]).any(1).float().mean()),
+        "acc_field": float((p[field] == y[field]).mean()) if field.any() else None,
+        "n_field": int(field.sum()),
+        "ece": ece(probs, labels),
+        "confident_threshold": None,
+    }
+    for t in np.linspace(0.30, 0.95, 27):       # lowest threshold whose "confident" answers are >= 90% right
+        m = conf >= t
+        if m.sum() >= 20 and (p[m] == y[m]).mean() >= 0.90:
+            out["confident_threshold"] = {"threshold": round(float(t), 3), "coverage": float(m.mean())}
+            break
+    recalls = []
+    for i, c in enumerate(names):
+        m = y == i
+        if m.sum() >= 10:
+            recalls.append((float((p[m] == i).mean()), c, int(m.sum())))
+    out["weakest_classes"] = [{"class": c, "recall": r, "n": n} for r, c, n in sorted(recalls)[:8]]
+    return out
+
+
+# ------------------------------------------------------------------ training
+def main():
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--config", default="config.yaml")
+    ap.add_argument("--model", default=DEFAULT_MODEL)
+    ap.add_argument("--epochs", type=int, default=6, help="total epochs (the first one trains only the new head)")
+    ap.add_argument("--samples", type=int, default=12000, help="images drawn per epoch")
+    ap.add_argument("--workers", type=int, help="data-loader workers (use 0 if Windows workers crash)")
+    ap.add_argument("--batch", type=int)
+    a = ap.parse_args()
+
+    cfg = yaml.safe_load(open(a.config, encoding="utf-8"))
+    tc = cfg["train"]
+    batch = a.batch or tc["batch"]
+    workers = tc["workers"] if a.workers is None else a.workers
+    size = cfg["img_size"]
+    random.seed(cfg["seed"]); np.random.seed(cfg["seed"]); torch.manual_seed(cfg["seed"])
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if device.type != "cuda":
+        raise SystemExit("CUDA is not available, so training would take many hours. Fix the PyTorch CUDA install "
+                         "(see README), or run this on Google Colab with a GPU.")
+
     rows = read_manifest(cfg["paths"]["manifest"])
-    img, tc = cfg["img_size"], cfg["train"]
+    names = sorted({r["label"] for r in rows})
+    idx = {c: i for i, c in enumerate(names)}
     split = {s: [r for r in rows if r["split"] == s] for s in ("train", "val", "test")}
+    print(f"[data] {len(names)} classes | train {len(split['train'])} | val {len(split['val'])} | "
+          f"test {len(split['test'])} | field images in test: {sum(r['is_field'] for r in split['test'])}")
 
-    # sampling weights: sqrt-inverse class frequency, field photos count more
+    model = timm.create_model(a.model, pretrained=True, num_classes=len(names), drop_rate=0.2)
+    dc = timm.data.resolve_model_data_config(model)
+    mean, std = list(dc["mean"]), list(dc["std"])
+    model.to(device).to(memory_format=torch.channels_last)
+    head = list(model.get_classifier().parameters())
+
     freq = {}
     for r in split["train"]:
         freq[r["label"]] = freq.get(r["label"], 0) + 1
-    w = [(1.0 / np.sqrt(freq[r["label"]])) * (tc["field_weight"] if r["is_field"] else 1.0) for r in split["train"]]
-    sampler = WeightedRandomSampler(w, num_samples=samples_per_epoch or len(w), replacement=True)
+    w = [(1 / math.sqrt(freq[r["label"]])) * (tc["field_weight"] if r["is_field"] else 1.0) for r in split["train"]]
+    sampler = WeightedRandomSampler(w, num_samples=a.samples, replacement=True)
 
-    kw = dict(num_workers=tc["workers"], pin_memory=True, persistent_workers=tc["workers"] > 0)
-    train = DataLoader(ManifestDataset(split["train"], class_to_idx, make_transforms(img, mean, std, True)),
-                       batch_size=tc["batch"], sampler=sampler, drop_last=True, **kw)
-    mk = lambda rs: DataLoader(ManifestDataset(rs, class_to_idx, make_transforms(img, mean, std, False)),  # noqa: E731
-                               batch_size=tc["batch"] * 2, shuffle=False, **kw)
-    # Small fixed subset of validation used for the per-epoch progress line and best-epoch choice (fast).
-    # The full validation split is still used for temperature calibration and the final numbers.
-    val_rows = split["val"]
-    if val_subset and val_subset < len(val_rows):
-        import random as _r
-        val_rows = _r.Random(cfg["seed"]).sample(val_rows, val_subset)
-    return train, mk(split["val"]), mk(split["test"]), split, mk(val_rows), [r["is_field"] for r in val_rows]
+    def loader(rs, train):
+        kw = dict(num_workers=workers, pin_memory=True, persistent_workers=workers > 0)
+        ds = Rows(rs, idx, make_transform(size, mean, std, train))
+        if train:
+            return DataLoader(ds, batch_size=batch, sampler=sampler, drop_last=True, **kw)
+        return DataLoader(ds, batch_size=batch * 2, shuffle=False, **kw)
 
+    train_dl = loader(split["train"], True)
+    val_dl, test_dl = loader(split["val"], False), loader(split["test"], False)
+    sub = random.Random(cfg["seed"]).sample(split["val"], min(3000, len(split["val"])))   # quick per-epoch check
+    sub_dl, sub_field = loader(sub, False), [r["is_field"] for r in sub]
 
-def run(cfg, model_name, epochs_head=None, epochs_full=None, tag=None, samples_per_epoch=None,
-        val_subset=None, workers=None):
-    seed_all(cfg["seed"])
-    tc = cfg["train"]
-    if workers is not None:
-        tc["workers"] = workers
-    epochs_head = tc["epochs_head"] if epochs_head is None else epochs_head
-    epochs_full = tc["epochs_full"] if epochs_full is None else epochs_full
-    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-
-    rows = read_manifest(cfg["paths"]["manifest"])
-    class_names = sorted({r["label"] for r in rows})
-    c2i = {c: i for i, c in enumerate(class_names)}
-
-    model = timm.create_model(model_name, pretrained=True, num_classes=len(class_names), drop_rate=0.2)
-    data_cfg = timm.data.resolve_model_data_config(model)
-    mean, std = list(data_cfg["mean"]), list(data_cfg["std"])
-    model.to(device).to(memory_format=torch.channels_last)
-
-    train_dl, val_dl, test_dl, split, val_sub_dl, val_sub_field = build_loaders(
-        cfg, mean, std, c2i, samples_per_epoch, val_subset)
-    print(f"[data] train {len(split['train'])} | val {len(split['val'])} | test {len(split['test'])} | "
-          f"{len(train_dl)} steps/epoch x {epochs_head + epochs_full} epochs | device {device}")
-    # EMA must average over a window much shorter than the run, or short runs end up blended with the untrained start
-    total_steps = len(train_dl) * (epochs_head + epochs_full)
-    ema_decay = max(0.9, min(tc["ema_decay"], 1 - 20.0 / max(1, total_steps)))
-    ema = ModelEmaV3(model, decay=ema_decay)
-    print(f"[ema] decay {ema_decay:.4f} for {total_steps} total steps")
-    if device.type != "cuda":
-        print("[warn] CUDA is not available: training on CPU will be extremely slow. Fix the PyTorch install first.")
-    val_field = [r["is_field"] for r in split["val"]]
-    test_field = [r["is_field"] for r in split["test"]]
-    mixup = Mixup(mixup_alpha=tc["mixup"], cutmix_alpha=tc["cutmix"], label_smoothing=tc["label_smoothing"],
-                  num_classes=len(class_names))
-    crit = SoftTargetCrossEntropy()
     try:
-        scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
-    except (AttributeError, TypeError):   # older torch
-        scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
+        scaler = torch.amp.GradScaler("cuda")
+    except (AttributeError, TypeError):
+        scaler = torch.cuda.amp.GradScaler()
+    crit = torch.nn.CrossEntropyLoss(label_smoothing=tc["label_smoothing"])
 
-    out_dir = Path(cfg["paths"]["runs_dir"]) / (tag or model_name)
+    steps = len(train_dl)
+    full_steps = max(1, (a.epochs - 1) * steps)
+    print(f"[train] {a.model} | {steps} steps/epoch x {a.epochs} epochs | batch {batch} | workers {workers}")
+
+    out_dir = Path(cfg["paths"]["runs_dir"]) / a.model
     out_dir.mkdir(parents=True, exist_ok=True)
-    (out_dir / "labels.txt").write_text("\n".join(class_names) + "\n", encoding="utf-8")
+    best_f1, best_state, step, t0 = -1.0, None, 0, time.time()
 
-    best_f1, best_state, bad, t0 = -1.0, None, 0, time.time()
-    total_epochs = epochs_head + epochs_full
-    steps_per_epoch = len(train_dl)
-    step = 0
-    head_params = [p for n, p in model.named_parameters() if n.startswith(("head", "classifier", "fc"))]
-
-    for epoch in range(total_epochs):
-        frozen = epoch < epochs_head
+    for epoch in range(a.epochs):
+        head_only = epoch == 0 and a.epochs > 1
         for p in model.parameters():
-            p.requires_grad = not frozen
-        for p in head_params:
+            p.requires_grad = not head_only
+        for p in head:
             p.requires_grad = True
-        base_lr = tc["lr_head"] if frozen else tc["lr_full"]
-        opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad], lr=base_lr,
-                                weight_decay=tc["weight_decay"])
+        if epoch <= 1:   # new optimiser when the set of trainable weights changes
+            opt = torch.optim.AdamW([p for p in model.parameters() if p.requires_grad],
+                                    lr=tc["lr_head"] if head_only else tc["lr_full"], weight_decay=tc["weight_decay"])
         model.train()
-        bar = tqdm(train_dl, desc=f"epoch {epoch + 1}/{total_epochs} {'(head)' if frozen else ''}", leave=False)
-        run_loss = 0.0
-        for i, (x, y) in enumerate(bar):
-            lr = cosine_lr(step, total_epochs * steps_per_epoch, steps_per_epoch, base_lr)
+        running = 0.0
+        for i, (x, y) in enumerate(tqdm(train_dl, desc=f"epoch {epoch + 1}/{a.epochs}" + (" (head)" if head_only else ""), leave=False)):
+            if head_only:
+                lr = tc["lr_head"]
+            else:
+                k = step - (steps if a.epochs > 1 else 0)   # steps taken in the full phase
+                lr = tc["lr_full"] * min(1.0, (k + 1) / 50) * 0.5 * (1 + math.cos(math.pi * min(1.0, k / full_steps)))
             for g in opt.param_groups:
                 g["lr"] = lr
             x = x.to(device, non_blocking=True).contiguous(memory_format=torch.channels_last)
             y = y.to(device, non_blocking=True)
-            x, ys = mixup(x, y)
-            with torch.autocast(device.type, enabled=device.type == "cuda"):
-                loss = crit(model(x), ys)
+            with torch.autocast("cuda"):
+                loss = crit(model(x), y)
             opt.zero_grad(set_to_none=True)
             scaler.scale(loss).backward()
             scaler.unscale_(opt)
             torch.nn.utils.clip_grad_norm_(model.parameters(), 2.0)
             scaler.step(opt)
             scaler.update()
-            ema.update(model, step=step)
             step += 1
-            run_loss += loss.item()
-            bar.set_postfix(loss=f"{run_loss / (i + 1):.3f}")
+            running += loss.item()
 
-        logits, labels = predict_logits(ema.module, val_sub_dl, device)
-        m = summarize(logits, labels, val_sub_field, class_names)
+        lg, lb = predict(model, sub_dl, device)
+        yv, pv = lb.numpy(), lg.argmax(1).numpy()
+        f1 = macro_f1(yv, pv, len(names))
+        fld = np.array(sub_field)
+        fa = float((pv[fld] == yv[fld]).mean()) if fld.any() else float("nan")
         done = epoch + 1
-        eta = (time.time() - t0) / done * (total_epochs - done)
-        print(f"epoch {done:>2}/{total_epochs}: loss {run_loss / steps_per_epoch:.3f} | val acc {m['acc']:.4f} "
-              f"| val field acc {m['acc_field']} | macro-F1 {m['macro_f1']:.4f} | {time.time() - t0:.0f}s elapsed, "
-              f"~{eta / 60:.0f} min left", flush=True)
-        if m["macro_f1"] > best_f1 and not frozen:
-            best_f1, bad = m["macro_f1"], 0
-            best_state = {k: v.detach().cpu().clone() for k, v in ema.module.state_dict().items()}
-        elif not frozen:
-            bad += 1
-            if bad >= tc["patience"]:
-                print("early stop")
-                break
+        eta = (time.time() - t0) / done * (a.epochs - done) / 60
+        print(f"epoch {done}/{a.epochs}: loss {running / max(1, steps):.3f} | val acc {(pv == yv).mean():.4f} | "
+              f"field acc {fa:.4f} | macro-F1 {f1:.4f} | ~{eta:.0f} min left", flush=True)
+        if f1 > best_f1:
+            best_f1 = f1
+            best_state = {k: v.detach().cpu().clone() for k, v in model.state_dict().items()}
 
-    if best_state is None:  # only head epochs requested
-        best_state = {k: v.detach().cpu().clone() for k, v in ema.module.state_dict().items()}
-    ema.module.load_state_dict(best_state)
-    net = ema.module
+    model.load_state_dict(best_state)
+    v_logits, v_labels = predict(model, val_dl, device)
+    temp = fit_temperature(v_logits, v_labels)
+    val_m = report(v_logits, v_labels, [r["is_field"] for r in split["val"]], names, temp)
+    t_logits, t_labels = predict(model, test_dl, device)
+    test_m = report(t_logits, t_labels, [r["is_field"] for r in split["test"]], names, temp)
+    raw_ece = report(t_logits, t_labels, [r["is_field"] for r in split["test"]], names, 1.0)["ece"]
 
-    # calibrate on VAL, report on held-out TEST
-    v_logits, v_labels = predict_logits(net, val_dl, device)
-    temperature = fit_temperature(v_logits, v_labels)
-    val_m = summarize(v_logits, v_labels, val_field, class_names, temperature)
-    t_logits, t_labels = predict_logits(net, test_dl, device)
-    test_m = summarize(t_logits, t_labels, test_field, class_names, temperature)
-    test_raw = summarize(t_logits, t_labels, test_field, class_names, 1.0)
+    torch.save({"state_dict": best_state, "classes": names, "model": a.model, "mean": mean, "std": std,
+                "img_size": size, "temperature": temp}, out_dir / "best.pt")
+    (out_dir / "labels.txt").write_text("\n".join(names) + "\n", encoding="utf-8")
+    (out_dir / "metrics.json").write_text(json.dumps(
+        {"model": a.model, "classes": len(names), "temperature": temp, "val": val_m, "test": test_m,
+         "test_ece_before_calibration": raw_ece, "train_minutes": (time.time() - t0) / 60}, indent=2), encoding="utf-8")
 
-    # CPU latency (desktop CPU, only for ranking candidates: measure the real phone with the app's Benchmark screen)
-    net_cpu = timm.create_model(model_name, pretrained=False, num_classes=len(class_names)).eval()
-    net_cpu.load_state_dict(best_state)
-    xin = torch.randn(1, 3, cfg["img_size"], cfg["img_size"])
-    with torch.no_grad():
-        for _ in range(3):
-            net_cpu(xin)
-        t1 = time.time()
-        for _ in range(15):
-            net_cpu(xin)
-    cpu_ms = (time.time() - t1) / 15 * 1000
-    params_m = sum(p.numel() for p in net_cpu.parameters()) / 1e6
-
-    metrics = {
-        "model": model_name, "img_size": cfg["img_size"], "classes": len(class_names),
-        "mean": mean, "std": std, "temperature": temperature, "params_m": params_m, "cpu_ms": cpu_ms,
-        "val": val_m, "test": test_m, "test_ece_before_calibration": test_raw["ece"],
-        "train_seconds": time.time() - t0,
-    }
-    torch.save({"state_dict": best_state, "classes": class_names, "model": model_name, "mean": mean, "std": std,
-                "img_size": cfg["img_size"], "temperature": temperature}, out_dir / "best.pt")
-    (out_dir / "metrics.json").write_text(json.dumps(metrics, indent=2), encoding="utf-8")
-
-    print("\n=== TEST (held-out, field-weighted) ===")
-    print(f"acc {test_m['acc']:.4f} | field acc {test_m['acc_field']} | macro-F1 {test_m['macro_f1']:.4f} | "
-          f"top3 {test_m['top3']:.4f} | ECE {test_m['ece']:.4f} (was {test_raw['ece']:.4f} before calibration) | T={temperature:.3f}")
-    print("most confused:")
-    for c in test_m["most_confused"][:10]:
-        print(f"  {c['n']:>3}  {c['true']}  ->  {c['pred']}")
-    print(f"saved {out_dir / 'best.pt'}")
-    return metrics
+    fa = test_m["acc_field"]
+    print("\n=== TEST RESULTS (images the model never saw) ===")
+    print(f"overall accuracy : {test_m['acc']:.4f}   ({test_m['n']} images)")
+    print(f"FIELD accuracy   : {'n/a' if fa is None else f'{fa:.4f}'}   ({test_m['n_field']} field images)  <- quote this one")
+    print(f"macro-F1 {test_m['macro_f1']:.4f} | top-3 {test_m['top3']:.4f} | "
+          f"calibration error {test_m['ece']:.4f} (was {raw_ece:.4f} before calibration) | T={temp:.3f}")
+    print("weakest classes:")
+    for c in test_m["weakest_classes"]:
+        print(f"  recall {c['recall']:.2f}  {c['class']}  (n={c['n']})")
+    print(f"\nsaved {out_dir / 'best.pt'}   total {(time.time() - t0) / 60:.1f} min\nNext: python export.py")
 
 
 if __name__ == "__main__":
-    ap = argparse.ArgumentParser()
-    ap.add_argument("--config", default="config.yaml")
-    ap.add_argument("--model", required=True)
-    ap.add_argument("--epochs-head", type=int)
-    ap.add_argument("--epochs-full", type=int)
-    ap.add_argument("--tag")
-    ap.add_argument("--samples-per-epoch", type=int, help="images drawn per epoch (default: the whole train split)")
-    ap.add_argument("--val-subset", type=int, help="images used for the per-epoch validation line (default: all)")
-    ap.add_argument("--workers", type=int, help="DataLoader workers (try 4, or 0 if Windows workers crash)")
-    ap.add_argument("--fast", action="store_true",
-                    help="time-boxed run, roughly 15-30 min on a mid-range GPU: 1 head + 5 full epochs of 12000 images")
-    a = ap.parse_args()
-    if a.fast:
-        a.epochs_head = 1 if a.epochs_head is None else a.epochs_head
-        a.epochs_full = 5 if a.epochs_full is None else a.epochs_full
-        a.samples_per_epoch = a.samples_per_epoch or 12000
-        a.val_subset = a.val_subset or 3000
-    run(load_cfg(a.config), a.model, a.epochs_head, a.epochs_full, a.tag, a.samples_per_epoch, a.val_subset, a.workers)
+    main()
