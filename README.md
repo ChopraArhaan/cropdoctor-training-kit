@@ -53,7 +53,7 @@ It fine-tunes a pretrained ImageNet backbone, so there is no need to train from 
 ## 4. Export for the app
 
 This step needs `ai-edge-torch`, which is Linux-first. On Windows use **WSL2** or **Google Colab** for this step only:
-copy `runs/<model>/best.pt`, `runs/<model>/metrics.json`, `config.yaml`, `data/manifest.csv` and the images it points to
+copy `export.py`, `config.yaml`, `runs/<model>/best.pt` and `runs/<model>/metrics.json` (the manifest and images are optional)
 (the parity check is skipped automatically if the images are missing).
 
 ```bash

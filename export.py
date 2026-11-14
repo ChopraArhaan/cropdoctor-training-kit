@@ -105,8 +105,10 @@ def main():
             shutil.copy(out / "model_fp16.tflite", final)
 
     # parity check on real validation images
-    with open(cfg["paths"]["manifest"], newline="", encoding="utf-8") as f:
-        rows = [r for r in csv.DictReader(f) if r["split"] == "val" and Path(r["path"]).exists()]
+    rows = []
+    if Path(cfg["paths"]["manifest"]).exists():
+        with open(cfg["paths"]["manifest"], newline="", encoding="utf-8") as f:
+            rows = [r for r in csv.DictReader(f) if r["split"] == "val" and Path(r["path"]).exists()]
     rows = rows[:: max(1, len(rows) // 40)][:40]
     if not rows:
         print("[check] skipped: the validation images listed in the manifest are not on this machine")
