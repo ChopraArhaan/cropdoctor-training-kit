@@ -52,11 +52,16 @@ It fine-tunes a pretrained ImageNet backbone, so there is no need to train from 
 
 ## 4. Export for the app
 
-This step needs `ai-edge-torch`, which is Linux-first. On Windows use **WSL2** or **Google Colab** for this step only:
-copy `export.py`, `config.yaml`, `runs/<model>/best.pt` and `runs/<model>/metrics.json` (the manifest and images are optional)
-(the parity check is skipped automatically if the images are missing).
+On Windows, use `export_tflite.py` with `onnx2tf` installed. On Linux or Google Colab, use `export.py` with `ai-edge-torch`.
+For a remote export, copy `export.py`, `config.yaml`, `runs/<model>/best.pt` and `runs/<model>/metrics.json`
+(the manifest and images are optional; the parity check is skipped automatically if the images are missing).
 
 ```bash
+# Windows
+python -m pip install onnx2tf
+python export_tflite.py
+
+# Linux / Google Colab
 pip install ai-edge-torch ai-edge-litert ai-edge-quantizer
 python export.py                       # add --fp16 for a smaller file
 ```
