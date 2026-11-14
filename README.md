@@ -70,8 +70,25 @@ What `prepare_data.py` guards against, so the numbers you report are honest:
 
 ## 4. Choose a backbone and train
 
+**Short on time?** Skip the bake-off and run the time-boxed training (about 15 to 30 minutes on a mid-range GPU):
+
 ```bash
-python bakeoff.py                  # ~short run of every candidate, writes runs/bakeoff.md
+python train.py --model mobilenetv4_conv_medium.e500_r256_in1k --fast
+python evaluate.py --run runs/mobilenetv4_conv_medium.e500_r256_in1k
+```
+
+`--fast` = 1 head epoch + 5 full epochs of 12,000 images each, validated on a 3,000-image subset. Watch the
+`~N min left` estimate printed every epoch. If it is far above your budget, stop and lower
+`--samples-per-epoch`. If you have more time, raise it, for example
+`--samples-per-epoch 30000 --epochs-full 8`. Useful flags: `--workers 4` (or `0` if Windows data-loader workers
+crash), `--epochs-head`, `--epochs-full`, `--val-subset`.
+
+If it prints `[warn] CUDA is not available`, stop: CPU training is far too slow. Reinstall the CUDA build of PyTorch.
+
+
+```bash
+python bakeoff.py                  # quick screening of every candidate (~5-10 min each), writes runs/bakeoff.md
+python bakeoff.py --only mobilenetv4_conv_medium.e500_r256_in1k convnextv2_nano.fcmae_ft_in22k_in1k   # just two
 python train.py --model mobilenetv4_conv_medium.e500_r256_in1k      # full run of the winner
 python evaluate.py --run runs/mobilenetv4_conv_medium.e500_r256_in1k
 python evaluate.py --run runs/<name> --folder data/my_test_photos   # photos the model never saw, ideal sanity check

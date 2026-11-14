@@ -25,7 +25,7 @@ from common import (ManifestDataset, cosine_lr, fit_temperature, load_cfg, make_
                     read_manifest, seed_all, summarize)
 
 
-def build_loaders(cfg, mean, std, class_to_idx):
+def build_loaders(cfg, mean, std, class_to_idx, samples_per_epoch=None, val_subset=None):
     rows = read_manifest(cfg["paths"]["manifest"])
     img, tc = cfg["img_size"], cfg["train"]
     split = {s: [r for r in rows if r["split"] == s] for s in ("train", "val", "test")}
@@ -35,19 +35,28 @@ def build_loaders(cfg, mean, std, class_to_idx):
     for r in split["train"]:
         freq[r["label"]] = freq.get(r["label"], 0) + 1
     w = [(1.0 / np.sqrt(freq[r["label"]])) * (tc["field_weight"] if r["is_field"] else 1.0) for r in split["train"]]
-    sampler = WeightedRandomSampler(w, num_samples=len(w), replacement=True)
+    sampler = WeightedRandomSampler(w, num_samples=samples_per_epoch or len(w), replacement=True)
 
     kw = dict(num_workers=tc["workers"], pin_memory=True, persistent_workers=tc["workers"] > 0)
     train = DataLoader(ManifestDataset(split["train"], class_to_idx, make_transforms(img, mean, std, True)),
                        batch_size=tc["batch"], sampler=sampler, drop_last=True, **kw)
     mk = lambda rs: DataLoader(ManifestDataset(rs, class_to_idx, make_transforms(img, mean, std, False)),  # noqa: E731
                                batch_size=tc["batch"] * 2, shuffle=False, **kw)
-    return train, mk(split["val"]), mk(split["test"]), split
+    # Small fixed subset of validation used for the per-epoch progress line and best-epoch choice (fast).
+    # The full validation split is still used for temperature calibration and the final numbers.
+    val_rows = split["val"]
+    if val_subset and val_subset < len(val_rows):
+        import random as _r
+        val_rows = _r.Random(cfg["seed"]).sample(val_rows, val_subset)
+    return train, mk(split["val"]), mk(split["test"]), split, mk(val_rows), [r["is_field"] for r in val_rows]
 
 
-def run(cfg, model_name, epochs_head=None, epochs_full=None, tag=None):
+def run(cfg, model_name, epochs_head=None, epochs_full=None, tag=None, samples_per_epoch=None,
+        val_subset=None, workers=None):
     seed_all(cfg["seed"])
     tc = cfg["train"]
+    if workers is not None:
+        tc["workers"] = workers
     epochs_head = tc["epochs_head"] if epochs_head is None else epochs_head
     epochs_full = tc["epochs_full"] if epochs_full is None else epochs_full
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
@@ -60,15 +69,27 @@ def run(cfg, model_name, epochs_head=None, epochs_full=None, tag=None):
     data_cfg = timm.data.resolve_model_data_config(model)
     mean, std = list(data_cfg["mean"]), list(data_cfg["std"])
     model.to(device).to(memory_format=torch.channels_last)
-    ema = ModelEmaV3(model, decay=tc["ema_decay"])
 
-    train_dl, val_dl, test_dl, split = build_loaders(cfg, mean, std, c2i)
+    train_dl, val_dl, test_dl, split, val_sub_dl, val_sub_field = build_loaders(
+        cfg, mean, std, c2i, samples_per_epoch, val_subset)
+    print(f"[data] train {len(split['train'])} | val {len(split['val'])} | test {len(split['test'])} | "
+          f"{len(train_dl)} steps/epoch x {epochs_head + epochs_full} epochs | device {device}")
+    # EMA must average over a window much shorter than the run, or short runs end up blended with the untrained start
+    total_steps = len(train_dl) * (epochs_head + epochs_full)
+    ema_decay = max(0.9, min(tc["ema_decay"], 1 - 20.0 / max(1, total_steps)))
+    ema = ModelEmaV3(model, decay=ema_decay)
+    print(f"[ema] decay {ema_decay:.4f} for {total_steps} total steps")
+    if device.type != "cuda":
+        print("[warn] CUDA is not available: training on CPU will be extremely slow. Fix the PyTorch install first.")
     val_field = [r["is_field"] for r in split["val"]]
     test_field = [r["is_field"] for r in split["test"]]
     mixup = Mixup(mixup_alpha=tc["mixup"], cutmix_alpha=tc["cutmix"], label_smoothing=tc["label_smoothing"],
                   num_classes=len(class_names))
     crit = SoftTargetCrossEntropy()
-    scaler = torch.amp.GradScaler(enabled=device.type == "cuda")
+    try:
+        scaler = torch.amp.GradScaler("cuda", enabled=device.type == "cuda")
+    except (AttributeError, TypeError):   # older torch
+        scaler = torch.cuda.amp.GradScaler(enabled=device.type == "cuda")
 
     out_dir = Path(cfg["paths"]["runs_dir"]) / (tag or model_name)
     out_dir.mkdir(parents=True, exist_ok=True)
@@ -112,10 +133,13 @@ def run(cfg, model_name, epochs_head=None, epochs_full=None, tag=None):
             run_loss += loss.item()
             bar.set_postfix(loss=f"{run_loss / (i + 1):.3f}")
 
-        logits, labels = predict_logits(ema.module, val_dl, device)
-        m = summarize(logits, labels, val_field, class_names)
-        print(f"epoch {epoch + 1:>2}: loss {run_loss / steps_per_epoch:.3f} | val acc {m['acc']:.4f} "
-              f"| val field acc {m['acc_field']} | macro-F1 {m['macro_f1']:.4f} | {time.time() - t0:.0f}s")
+        logits, labels = predict_logits(ema.module, val_sub_dl, device)
+        m = summarize(logits, labels, val_sub_field, class_names)
+        done = epoch + 1
+        eta = (time.time() - t0) / done * (total_epochs - done)
+        print(f"epoch {done:>2}/{total_epochs}: loss {run_loss / steps_per_epoch:.3f} | val acc {m['acc']:.4f} "
+              f"| val field acc {m['acc_field']} | macro-F1 {m['macro_f1']:.4f} | {time.time() - t0:.0f}s elapsed, "
+              f"~{eta / 60:.0f} min left", flush=True)
         if m["macro_f1"] > best_f1 and not frozen:
             best_f1, bad = m["macro_f1"], 0
             best_state = {k: v.detach().cpu().clone() for k, v in ema.module.state_dict().items()}
@@ -178,5 +202,15 @@ if __name__ == "__main__":
     ap.add_argument("--epochs-head", type=int)
     ap.add_argument("--epochs-full", type=int)
     ap.add_argument("--tag")
+    ap.add_argument("--samples-per-epoch", type=int, help="images drawn per epoch (default: the whole train split)")
+    ap.add_argument("--val-subset", type=int, help="images used for the per-epoch validation line (default: all)")
+    ap.add_argument("--workers", type=int, help="DataLoader workers (try 4, or 0 if Windows workers crash)")
+    ap.add_argument("--fast", action="store_true",
+                    help="time-boxed run, roughly 15-30 min on a mid-range GPU: 1 head + 5 full epochs of 12000 images")
     a = ap.parse_args()
-    run(load_cfg(a.config), a.model, a.epochs_head, a.epochs_full, a.tag)
+    if a.fast:
+        a.epochs_head = 1 if a.epochs_head is None else a.epochs_head
+        a.epochs_full = 5 if a.epochs_full is None else a.epochs_full
+        a.samples_per_epoch = a.samples_per_epoch or 12000
+        a.val_subset = a.val_subset or 3000
+    run(load_cfg(a.config), a.model, a.epochs_head, a.epochs_full, a.tag, a.samples_per_epoch, a.val_subset, a.workers)

@@ -63,8 +63,8 @@ def make_transforms(img, mean, std, train):
 
 
 class ManifestDataset(Dataset):
-    def __init__(self, rows, class_to_idx, transform):
-        self.rows, self.c2i, self.tf = rows, class_to_idx, transform
+    def __init__(self, rows, class_to_idx, transform, draft=512):
+        self.rows, self.c2i, self.tf, self.draft = rows, class_to_idx, transform, draft
 
     def __len__(self):
         return len(self.rows)
@@ -72,7 +72,12 @@ class ManifestDataset(Dataset):
     def __getitem__(self, i):
         r = self.rows[i]
         try:
-            im = Image.open(r["path"]).convert("RGB")
+            im = Image.open(r["path"])
+            if self.draft:
+                # JPEG fast path: let the decoder shrink big photos (4000 px phone images) while reading.
+                # It never goes below `draft` px on either side, so the 256 px model input is unaffected.
+                im.draft("RGB", (self.draft, self.draft))
+            im = im.convert("RGB")
         except Exception:  # noqa: BLE001
             im = Image.new("RGB", (256, 256), (127, 127, 127))
         return self.tf(im), self.c2i[r["label"]]

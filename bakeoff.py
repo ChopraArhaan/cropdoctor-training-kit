@@ -24,9 +24,12 @@ results = []
 for name in (a.only or cfg["models"]):
     print(f"\n################ {name} ################")
     try:
-        kw = {} if a.full else dict(epochs_head=3, epochs_full=6)
+        # default = quick screening run (about 5-10 min per model on a mid-range GPU); --full = the config epochs
+        kw = {} if a.full else dict(epochs_head=1, epochs_full=3, samples_per_epoch=8000, val_subset=2000)
         results.append(run(cfg, name, tag=f"bake_{name}", **kw))
     except Exception as e:  # noqa: BLE001
+        import traceback
+        traceback.print_exc()
         print(f"FAILED {name}: {e}")
 
 results.sort(key=lambda m: (m["test"]["acc_field"] or 0) + m["test"]["macro_f1"], reverse=True)
