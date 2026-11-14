@@ -50,12 +50,23 @@ Strongly recommended, because it is the biggest accuracy lever:
 ## 3. Prepare data
 
 ```bash
-python taxonomy.py                 # shows the 45 classes the app knows about
+python taxonomy.py                 # lists every class the taxonomy knows about
 python prepare_data.py             # downloads, maps, de-duplicates, splits  -> data/manifest.csv
 ```
 
 Read `data/unmapped.txt`. It lists dataset folders that did not match the taxonomy. If one is a class you care
 about, add a rule in `taxonomy.py` (and a matching entry in the app's `knowledge_base.json`).
+
+What `prepare_data.py` guards against, so the numbers you report are honest:
+
+* **Field vs lab flag.** `field: true` is only for real phone/field photos. A big lab-style collection marked
+  `field: true` makes every class look like "field" and the field accuracy meaningless. Check the printed
+  per-class lines and `is_field` in `data/manifest.csv`.
+* **Source balance.** `data.max_per_source_per_class` stops one huge dataset from filling a class on its own.
+* **One-sided crops are dropped** (`[drop crop]` in the output): a crop with only a healthy class would call a
+  diseased leaf healthy; a crop with only disease classes would call a healthy leaf diseased. Add the missing side
+  to keep the crop.
+* **Local datasets.** `kind: local` paths may use `~` and `$ENV_VARS`; a missing folder is reported, not ignored.
 
 ## 4. Choose a backbone and train
 

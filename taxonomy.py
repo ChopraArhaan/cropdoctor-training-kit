@@ -157,6 +157,30 @@ def all_expected_classes() -> list[str]:
     return sorted(out)
 
 
+def one_sided_crops(counts: dict, min_images: int = 1) -> dict:
+    """
+    Crops that cannot be classified safely because they have only a healthy class or only disease classes.
+
+    A crop with only 'healthy' would label a diseased leaf healthy; a crop with only diseases would call every
+    healthy leaf diseased. Both mislead a farmer, so prepare_data.py drops such crops (and says so).
+    `counts` maps class id -> number of images. Returns {crop: reason}.
+    """
+    by_crop: dict = {}
+    for cid, n in counts.items():
+        if cid == BACKGROUND or n < min_images or "___" not in cid:
+            continue
+        crop, disease = cid.split("___", 1)
+        side = by_crop.setdefault(crop, {"healthy": False, "disease": False})
+        side["healthy" if disease == "healthy" else "disease"] = True
+    out = {}
+    for crop, side in by_crop.items():
+        if side["healthy"] and not side["disease"]:
+            out[crop] = "has a healthy class but no disease class"
+        elif side["disease"] and not side["healthy"]:
+            out[crop] = "has disease classes but no healthy class"
+    return out
+
+
 if __name__ == "__main__":
     classes = all_expected_classes()
     print(len(classes), "classes in the taxonomy")

@@ -21,10 +21,14 @@ sources:
   - {name: paddy_doctor,  kind: hf,     handle: anthony2261/paddy-disease-classification,       crop: Rice,   field: true, split: "train"}
   # Your own labelled photos: data/my_photos/<Crop___disease_id or any name the taxonomy understands>/*.jpg
   - {name: my_photos,     kind: local,  path: data/my_photos, field: true}
-  - {name: research_merged, kind: local, path: C:/Users/ASUS/Downloads/Research/merged, field: true}
+  # Large merged collection. Provenance and licence must be confirmed before you rely on it. It is marked
+  # field: false because it contains lab-style photos; flipping it to true would make every class look "field".
+  # Put or link it at data/research_merged, or set the path to any folder ("~" and $ENV_VARS are expanded).
+  - {name: research_merged, kind: local, path: data/research_merged, field: false}
 
 data:
   max_per_class: 1500     # cap per class (field photos are kept first)
+  max_per_source_per_class: 700   # no single source may supply more than this per class (keeps sources balanced)
   min_per_class: 40       # classes with fewer images are dropped with a warning
   dedup_hamming: 6        # near-duplicate threshold for perceptual hash grouping (leak-free split)
   # split fractions (train/val/test) for FIELD groups and LAB groups
@@ -32,8 +36,8 @@ data:
   split_lab:   [0.85, 0.08, 0.07]
 
 negatives:                # the "Background___not_a_leaf" class
-  use_dtd: false          # Describable Textures (walls, soil-ish, fabric...) auto-downloaded by torchvision
-  use_pets: false         # Oxford-IIIT Pets (animals / household scenes) auto-downloaded by torchvision
+  use_dtd: true           # Describable Textures (walls, soil-ish, fabric...) auto-downloaded by torchvision
+  use_pets: true          # Oxford-IIIT Pets (animals / household scenes) auto-downloaded by torchvision
   max_total: 2500
 
 train:

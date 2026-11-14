@@ -24,7 +24,7 @@ import yaml
 from PIL import Image, ImageFile
 from tqdm import tqdm
 
-from taxonomy import BACKGROUND, canonical
+from taxonomy import BACKGROUND, canonical, one_sided_crops
 
 ImageFile.LOAD_TRUNCATED_IMAGES = True
 IMG_EXT = {".jpg", ".jpeg", ".png", ".bmp", ".webp"}
@@ -75,9 +75,11 @@ def locate_sources(cfg, download: bool) -> dict:
     for src in cfg["sources"]:
         name = src["name"]
         if src["kind"] == "local":
-            p = Path(src["path"])
+            p = Path(os.path.expandvars(os.path.expanduser(str(src["path"]))))
             if p.exists():
                 found[name] = (p, src)
+            else:
+                print(f"[local SKIP] {name}: folder not found: {p}")
             continue
         manual = raw / name
         if manual.exists() and any(manual.iterdir()):
@@ -202,6 +204,28 @@ def main():
     Path("data/unmapped.txt").write_text("\n".join(sorted(unmapped)), encoding="utf-8")
     print(f"[scan] {len(unmapped)} folders outside the taxonomy -> data/unmapped.txt")
 
+    # Cap each source per class so one huge dataset cannot crowd out the others (and cannot flood the cap with
+    # its own photos, which would also distort the field/lab balance).
+    per_src = dcfg.get("max_per_source_per_class")
+    if per_src:
+        for d in per_class.values():
+            for kind in ("field", "lab"):
+                random.shuffle(d[kind])
+                seen = defaultdict(int)
+                kept = []
+                for p_, s_ in d[kind]:
+                    seen[s_] += 1
+                    if seen[s_] <= per_src:
+                        kept.append((p_, s_))
+                d[kind] = kept
+
+    # Drop crops that have only a healthy class or only disease classes: they would mislead (see taxonomy.py).
+    counts = {lab: len(d["field"]) + len(d["lab"]) for lab, d in per_class.items()}
+    for crop, why in sorted(one_sided_crops(counts, dcfg["min_per_class"]).items()):
+        print(f"[drop crop] {crop}: {why}. Add the missing side to the datasets to keep it.")
+        for lab in [k for k in per_class if k.startswith(crop + "___")]:
+            del per_class[lab]
+
     rows = []
     for label, d in sorted(per_class.items()):
         random.shuffle(d["field"])
@@ -217,7 +241,7 @@ def main():
         # first group always goes to train so every class is trainable; one group to val/test if there are enough
         random.shuffle(groups)
         for gi, g in enumerate(groups):
-            is_field = g[0] in field_set
+            is_field = any(x in field_set for x in g)
             split = "train" if gi == 0 else pick_split(is_field, cfg)
             for p in g:
                 rows.append((p, label, src_of[p], int(p in field_set), split))
